@@ -2,12 +2,16 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import joblib
+from pathlib import Path
 from sklearn.datasets import fetch_california_housing
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LinearRegression, Ridge, Lasso
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, HistGradientBoostingRegressor
 from sklearn.metrics import mean_squared_error, r2_score
+
+CACHE_PATH = Path('models_cache.pkl')
 
 # ─── Page Config ────────────────────────────────────────────────
 st.set_page_config(
@@ -108,17 +112,23 @@ st.markdown("""
 def load_data():
     try:
         housing = fetch_california_housing()
-        df = pd.DataFrame(housing.data, columns=housing.feature_names)
-        df['Price'] = housing.target
-        return df
     except Exception as exc:
-        raise RuntimeError(
-            "Unable to load the California Housing dataset. "
-            "Please check your network connection or local sklearn cache."
-        ) from exc
+        st.error("Failed to load dataset. Please refresh.")
+        st.stop()
+
+    df = pd.DataFrame(housing.data, columns=housing.feature_names)
+    df['rooms_per_person'] = df['AveRooms'] / df['AveOccup']
+    df['bedrooms_per_room'] = df['AveBedrms'] / df['AveRooms']
+    df['income_per_household'] = df['MedInc'] / df['AveOccup']
+    df['log_population'] = np.log1p(df['Population'])
+    df['Price'] = housing.target
+    return df
 
 @st.cache_resource
 def train_models(df):
+    if CACHE_PATH.exists():
+        return joblib.load(CACHE_PATH)
+
     X = df.drop('Price', axis=1)
     y = df['Price']
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -126,35 +136,67 @@ def train_models(df):
     X_train_s = scaler.fit_transform(X_train)
     X_test_s  = scaler.transform(X_test)
 
+    rf_search = RandomizedSearchCV(
+        estimator=RandomForestRegressor(random_state=42),
+        param_distributions={
+            'n_estimators': [100, 200, 300],
+            'max_depth': [None, 10, 20, 30],
+            'min_samples_leaf': [1, 2, 4],
+            'max_features': ['sqrt', 'log2'],
+        },
+        n_iter=5,
+        cv=2,
+        scoring='r2',
+        random_state=42,
+        n_jobs=-1,
+    )
+    rf_search.fit(X_train, y_train)
+    tuned_random_forest = rf_search.best_estimator_
+
+    hgb_search = RandomizedSearchCV(
+        estimator=HistGradientBoostingRegressor(random_state=42),
+        param_distributions={
+            'learning_rate': [0.05, 0.1, 0.2],
+            'max_iter': [200, 300, 500],
+            'max_depth': [3, 5, 7, None],
+            'min_samples_leaf': [10, 20, 30],
+        },
+        n_iter=5,
+        cv=2,
+        scoring='r2',
+        random_state=42,
+        n_jobs=-1,
+    )
+    hgb_search.fit(X_train, y_train)
+    tuned_hist_gradient_boosting = hgb_search.best_estimator_
+
     models = {
         'Linear Regression': (LinearRegression(), True),
         'Ridge':             (Ridge(alpha=1.0), True),
         'Lasso':             (Lasso(alpha=0.1), True),
-        'Random Forest':     (RandomForestRegressor(n_estimators=100, random_state=42), False),
+        'Random Forest':     (tuned_random_forest, False),
         'Gradient Boosting': (GradientBoostingRegressor(n_estimators=200, learning_rate=0.1, random_state=42), False),
+        'HistGradientBoosting': (tuned_hist_gradient_boosting, False),
     }
 
     results = {}
     for name, (model, scaled) in models.items():
         Xtr = X_train_s if scaled else X_train
         Xte = X_test_s  if scaled else X_test
-        model.fit(Xtr, y_train)
+        if name not in ['Random Forest', 'HistGradientBoosting']:
+            model.fit(Xtr, y_train)
         y_pred = model.predict(Xte)
         rmse = np.sqrt(mean_squared_error(y_test, y_pred))
         r2   = r2_score(y_test, y_pred)
         results[name] = {'model': model, 'rmse': rmse, 'r2': r2, 'scaled': scaled,
                          'y_test': y_test, 'y_pred': y_pred}
 
-    return results, scaler, X_test, y_test
+    trained_artifacts = (results, scaler)
+    joblib.dump(trained_artifacts, CACHE_PATH)
+    return trained_artifacts
 
-try:
-    df = load_data()
-except RuntimeError as exc:
-    st.error("Dataset unavailable. The app cannot continue right now.")
-    st.caption(str(exc))
-    st.stop()
-
-results, scaler, X_test, y_test = train_models(df)
+df = load_data()
+results, scaler = train_models(df)
 best_model_name = min(results, key=lambda x: results[x]['rmse'])
 
 # ─── Sidebar ────────────────────────────────────────────────────
@@ -197,7 +239,7 @@ if page == "🏠 Overview":
         st.markdown("#### 💡 What This App Does")
         st.markdown("""
         - 📊 **Exploratory Data Analysis** — distributions, correlations, geo map
-        - 🤖 **5 ML Models** compared — Linear, Ridge, Lasso, Random Forest, Gradient Boosting
+        - 🤖 **6 ML Models** compared — Linear, Ridge, Lasso, Random Forest, Gradient Boosting, HistGradientBoosting
         - 🔮 **Live Predictor** — input house features, get instant price estimate
         - 📈 **Visual insights** — Plotly interactive charts throughout
         """)
@@ -374,9 +416,25 @@ elif page == "🔮 Predict Price":
         ave_occup  = st.slider("Avg Occupancy per Household", 1.0, 20.0, 3.0)
 
     # Predict
-    input_data = pd.DataFrame([[med_inc, house_age, ave_rooms, ave_bedrms,
-                                 population, ave_occup, latitude, longitude]],
-                               columns=df.drop('Price', axis=1).columns)
+    rooms_per_person = ave_rooms / ave_occup
+    bedrooms_per_room = ave_bedrms / ave_rooms
+    income_per_household = med_inc / ave_occup
+    log_population = np.log1p(population)
+
+    input_data = pd.DataFrame([{
+        'MedInc': med_inc,
+        'HouseAge': house_age,
+        'AveRooms': ave_rooms,
+        'AveBedrms': ave_bedrms,
+        'Population': population,
+        'AveOccup': ave_occup,
+        'Latitude': latitude,
+        'Longitude': longitude,
+        'rooms_per_person': rooms_per_person,
+        'bedrooms_per_room': bedrooms_per_room,
+        'income_per_household': income_per_household,
+        'log_population': log_population,
+    }], columns=df.drop('Price', axis=1).columns)
 
     model_info = results[model_choice]
     if model_info['scaled']:
