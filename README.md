@@ -34,9 +34,9 @@ Predicting housing prices is a classic regression problem with real-world impact
 | Lasso Regression         | 56.5%     | $75,472     |
 | Random Forest            | 79.2%     | $52,201     |
 | Gradient Boosting        | 80.2%     | $50,899     |
-| **HistGradientBoosting** | **84.8%** | **$44,697** |
+| **HistGradientBoosting** | **84.5%** | **$44,697** |
 
-> Best model: **HistGradientBoosting** with R² of 84.8% and RMSE of $44,697
+> Best model: **HistGradientBoosting** with R² of 84.5% and RMSE of $44,697
 
 ---
 
